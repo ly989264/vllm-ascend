@@ -165,6 +165,28 @@ def _pd_mark_request_done(req_meta: dict[str, Any]) -> None:
         pass
 
 
+# Request-level fields left out at diagnostics level 1; the per-task records keep their own timings.
+_PD_LEVEL2_REQUEST_FIELDS = (
+    "task_max_queue_wait_ns",
+    "task_max_meta_fetch_ns",
+    "task_max_prepare_ns",
+    "transfer_envelope_ns",
+)
+
+
+def _pd_diag_level() -> int:
+    """This process's diagnostics level: pd_diagnostics.diag_level() when the vLLM patch has it, else 3.
+
+    Only 1, 2 and 3 are levels; any other value, or any error, is 3. Call once at initialization and keep it.
+    """
+    try:
+        level_of = getattr(diag, "diag_level", None)
+        level = level_of() if callable(level_of) else 3
+        return level if type(level) is int and level in (1, 2, 3) else 3
+    except Exception:
+        return 3
+
+
 class RemotePortInfo(TypedDict):
     num: int
     host: str
@@ -568,6 +590,7 @@ class KVCacheRecvingThread(threading.Thread):
         self.finished_request_markers: set[str] = set()
         self.request_task_counts_lock = threading.Lock()
         self.pd_connector_id = diag.new_id("pd_connector")
+        self.pd_diag_level = _pd_diag_level()
         self.pd_request_tasks: dict[str, dict[str, Any]] = {}
 
         self.task_tracker = KVCacheTaskTracker()
@@ -1023,14 +1046,15 @@ class KVCacheRecvingThread(threading.Thread):
                     summary["first_queued_ns"] = task["queued_ns"]
                 if task.get("request_done_ns") is not None:
                     summary["request_done_ns"] = task["request_done_ns"]
-                stages = task["associated_stages"]
-                for key, value in (
-                    ("task_max_queue_wait_ns", start_ns - task["queued_ns"]),
-                    ("task_max_meta_fetch_ns", (stages.get("meta_fetch") or {}).get("duration_ns")),
-                    ("task_max_prepare_ns", (stages.get("prepare") or {}).get("duration_ns")),
-                ):
-                    if value is not None and (summary[key] is None or value > summary[key]):
-                        summary[key] = value
+                if self.pd_diag_level >= 2:
+                    stages = task["associated_stages"]
+                    for key, value in (
+                        ("task_max_queue_wait_ns", start_ns - task["queued_ns"]),
+                        ("task_max_meta_fetch_ns", (stages.get("meta_fetch") or {}).get("duration_ns")),
+                        ("task_max_prepare_ns", (stages.get("prepare") or {}).get("duration_ns")),
+                    ):
+                        if value is not None and (summary[key] is None or value > summary[key]):
+                            summary[key] = value
                 if summary["pending_tasks"] == 0 and summary["final_task_queued"]:
                     completed = self.pd_request_tasks.pop(req_meta["request_id"])
             if completed is not None:
@@ -1041,9 +1065,8 @@ class KVCacheRecvingThread(threading.Thread):
                 )
                 # A request can span several executions and remote engines. Task events
                 # carry those identities; do not attribute the whole request to the last.
-                diag.emit(
-                    "pd_transfer_summary",
-                    **{
+                fields = dict(
+                    {
                         key: value
                         for key, value in completed.items()
                         if key not in ("transfer_start_ns", "transfer_end_ns", "first_queued_ns", "request_done_ns")
@@ -1073,6 +1096,10 @@ class KVCacheRecvingThread(threading.Thread):
                     complete=not completed["native_calls_dropped"],
                     incomplete=bool(completed["native_calls_dropped"]),
                 )
+                if self.pd_diag_level < 2:
+                    for key in _PD_LEVEL2_REQUEST_FIELDS:
+                        del fields[key]
+                diag.emit("pd_transfer_summary", **fields)
         except Exception:
             pass
 
@@ -1120,7 +1147,7 @@ class KVCacheRecvingThread(threading.Thread):
             task["transfer_end_ns"] = end_ns
             with self.request_task_counts_lock:
                 summary = self.pd_request_tasks.get(req_meta["request_id"])
-                if summary is not None:
+                if summary is not None and self.pd_diag_level >= 2:
                     if summary["transfer_start_ns"] is None:
                         summary["transfer_start_ns"] = start_ns
                     else:
