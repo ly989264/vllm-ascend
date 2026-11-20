@@ -209,6 +209,28 @@ def call_spans(function, call_text):
     return found
 
 
+def stage_blocks(function, name=None):
+    """The `with pd_device_timing.stage(self, "<name>")` blocks inside this function, by stage name."""
+    found = {}
+
+    def visit(node):
+        if isinstance(node, ast.With):
+            for item in node.items:
+                call = item.context_expr
+                if (isinstance(call, ast.Call) and ast.unparse(call.func) == "pd_device_timing.stage"
+                        and len(call.args) == 2):
+                    found.setdefault(ast.literal_eval(call.args[1]), []).append(node)
+        for child in ast.iter_child_nodes(node):
+            visit(child)
+
+    visit(function)
+    return found if name is None else found.get(name, [])
+
+
+def calls_in(node):
+    return {ast.unparse(child.func) for child in ast.walk(node) if isinstance(child, ast.Call)}
+
+
 class RunnerPlacementTest(unittest.TestCase):
     def test_v1_decorators_and_call_sites(self):
         v1 = runner_methods(V1)
@@ -252,6 +274,50 @@ class RunnerPlacementTest(unittest.TestCase):
         )
         # V2 keeps host timing only.
         self.assertNotIn("pd_device_timing", V2.read_text(encoding="utf-8"))
+
+    def test_v1_t56_stage_points(self):
+        """The four T56 stages: one block each, around the calls the segment is defined as."""
+        v1 = runner_methods(V1)
+        blocks = {name: stage_blocks(v1[name]) for name in ("execute_model", "sample_tokens")}
+        self.assertEqual(sorted(blocks["execute_model"]), ["lm_head", "prepare_inputs"])
+        self.assertEqual(sorted(blocks["sample_tokens"]), ["bookkeeping", "draft"])
+        for name, found in blocks.items():
+            for stage, nodes in found.items():
+                self.assertEqual(len(nodes), 1, f"{stage} must be measured in one place in {name}")
+
+        prepare = calls_in(blocks["execute_model"]["prepare_inputs"][0])
+        for call in ("self._update_states", "self._prepare_inputs", "self._determine_batch_execution_and_padding",
+                     "self._build_attention_metadata", "self._preprocess", "self.synchronize_input_prep"):
+            self.assertIn(call, prepare)
+        self.assertNotIn("self._model_forward", prepare)  # the forward stage keeps its own events
+
+        lm_head = calls_in(blocks["execute_model"]["lm_head"][0])
+        self.assertIn("self.model.compute_logits", lm_head)
+        self.assertNotIn("self._model_forward", lm_head)
+
+        bookkeeping = calls_in(blocks["sample_tokens"]["bookkeeping"][0])
+        self.assertIn("self._bookkeeping_sync", bookkeeping)
+        self.assertNotIn("self.propose_draft_token_ids", bookkeeping)
+
+        # The draft block sits inside the closure, so it covers each of its call sites exactly once.
+        draft_block = blocks["sample_tokens"]["draft"][0]
+        draft = calls_in(draft_block)
+        for call in ("self.propose_draft_token_ids", "self._skip_drafting", "self._copy_draft_token_ids_to_cpu"):
+            self.assertIn(call, draft)
+        closures = [node for node in ast.walk(v1["sample_tokens"])
+                    if isinstance(node, ast.FunctionDef) and node.name == "propose_draft_token_ids"]
+        self.assertEqual(len(closures), 1)
+        self.assertIn(draft_block, list(ast.iter_child_nodes(closures[0])))
+        self.assertGreaterEqual(len(call_spans(v1["sample_tokens"], "propose_draft_token_ids")), 2)
+
+        # The graph mode of the step, once, next to where the runner works it out.
+        self.assertEqual(len(call_spans(v1["execute_model"], "pd_device_timing.note_cudagraph_mode")), 1)
+
+    def test_v1_t56_stages_are_not_on_the_dummy_paths(self):
+        v1 = runner_methods(V1)
+        for name in ("_dummy_run", "_dummy_sampler_run", "profile_run", "capture_model"):
+            self.assertEqual(stage_blocks(v1[name]), {}, f"{name} must not measure a T56 stage")
+            self.assertEqual(call_spans(v1[name], "pd_device_timing.note_cudagraph_mode"), [])
 
     def test_imports_name_the_vllm_patch_symbols(self):
         for path in (V1, V2):

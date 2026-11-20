@@ -1,10 +1,16 @@
-"""Device-event timing of the V1 runner's forward and sampling, for the [PD_DIAG] worker_summary records.
+"""Device-event timing of the V1 runner's steps, for the [PD_DIAG] worker_summary records.
 
 On tp_rank 0 only, each step records a pair of NPU events, on the current compute stream, right around the target
 model call ("forward") and around the sampler call ("sampling"). The step's two worker_summary records (phase
 "execute" and "sample") are held open with vLLM's pd_claim_finish() and written, strictly in step order, once the
-events are read; the value goes into stages.forward / stages.sampling as device_duration_ns, next to the unchanged
-host duration_ns. Reading never waits: query() both events first, elapsed_time() only when both completed.
+events are read; the value goes into stages.<name> as device_duration_ns, next to the unchanged host duration_ns.
+Reading never waits: query() both events first, elapsed_time() only when both completed.
+
+T56 adds four more stages around the rest of the step -- "prepare_inputs", "lm_head" (execute), "draft",
+"bookkeeping" (sample) -- through stage(), which opens the host span and the device events together. They are
+written only on a PD decode node (is_pd_decode(), T56 convention 0.8) and only for the stages VLLM_PD_DEVICE_STAGES
+leaves on, so a prefill node's records stay byte-identical to the T51 version. The six stages run one after another
+on the same compute stream, so their device intervals do not overlap and may be summed.
 
 Where the events are read:
   - synchronous runs (P): when sample_tokens returns; the sampled tokens were already copied to the host there;
@@ -19,23 +25,52 @@ from __future__ import annotations
 
 import atexit
 import math
+import os
 import threading
 from collections import deque
 from contextlib import contextmanager
 from typing import Any
 
 SLOTS = 4  # event pairs kept per stage; also the number of steps a read may lag
-_PHASE_OF_STAGE = {"forward": "execute", "sampling": "sample"}
+# The order the stages run in within one step; also the order the startup line lists them.
+STAGE_ORDER = ("forward", "sampling", "prepare_inputs", "lm_head", "draft", "bookkeeping")
+# T51 measures these two unconditionally; VLLM_PD_DEVICE_STAGES never touches them.
+BASE_STAGES = ("forward", "sampling")
+# T56 adds these; each one can be switched off, and all of them are off unless this is a decode node.
+OPTIONAL_STAGES = ("prepare_inputs", "lm_head", "draft", "bookkeeping")
+_PHASE_OF_STAGE = {
+    "forward": "execute",
+    "sampling": "sample",
+    "prepare_inputs": "execute",
+    "lm_head": "execute",
+    "draft": "sample",
+    "bookkeeping": "sample",
+}
+_ENV_STAGES = "VLLM_PD_DEVICE_STAGES"      # unset: all four; a comma-separated subset; "none": back to T51
+# The envelope of one step: the start of the first stage to the end of the last one.
+_SPAN_FROM, _SPAN_TO = "prepare_inputs", "draft"
+
+
+def _parse_stages(raw: str | None) -> tuple[tuple[str, ...], str]:
+    """(stages to measure, where that came from). Unknown names are ignored; the startup line shows what took
+    effect. forward/sampling are not switchable, so naming them here does nothing."""
+    if raw is None:
+        return OPTIONAL_STAGES, "default"
+    wanted = {part.strip() for part in raw.split(",")}
+    if "none" in {part.lower() for part in wanted}:
+        return (), "env"
+    return tuple(name for name in OPTIONAL_STAGES if name in wanted), "env"
 
 
 class _Step:
-    __slots__ = ("seq", "execution_id", "slot", "claims", "recorded", "repeated", "settled", "broken")
+    __slots__ = ("seq", "execution_id", "slot", "claims", "batches", "recorded", "repeated", "settled", "broken")
 
     def __init__(self, seq: int, execution_id: Any, slot: int | None):
         self.seq = seq
         self.execution_id = execution_id
         self.slot = slot
         self.claims: dict[str, Any] = {}
+        self.batches: dict[str, Any] = {}
         self.recorded: set[str] = set()
         self.repeated: set[str] = set()
         self.settled = False
@@ -44,13 +79,18 @@ class _Step:
 
 class DeviceTiming:
     def __init__(self, *, enabled: bool, new_event=None, current_stream=None, capturing=None, claim_finish=None,
-                 current_context=None):
+                 current_context=None, current_batch=None, stages: tuple[str, ...] = (), stages_source: str = "default",
+                 decode_node: bool = False):
         self.enabled = enabled
         self._new_event = new_event
         self._current_stream = current_stream
         self._capturing = capturing
         self._claim_finish = claim_finish
         self._current_context = current_context
+        self._current_batch = current_batch
+        self.decode_node = bool(decode_node) and enabled
+        self.stages = frozenset(stages) if self.decode_node else frozenset()
+        self._stages_source = stages_source
         self._lock = threading.Lock()
         self._steps: deque[_Step] = deque()
         self._events: list[dict[str, tuple[Any, Any]]] = [{} for _ in range(SLOTS)]
@@ -59,8 +99,31 @@ class DeviceTiming:
         if enabled:
             atexit.register(self.release_all)
 
+    @property
+    def runner_stages(self) -> tuple[str, ...]:
+        """What the Worker startup line lists, in step order. Empty on anything but a decode node, so the line --
+        and the records -- stay byte-identical to the T51 version there. On a decode node it always lists at least
+        forward and sampling, so "switched off here" (forward,sampling) reads differently from "not a decode node"
+        (no runner_stages on the line at all)."""
+        if not self.decode_node:
+            return ()
+        return tuple(name for name in STAGE_ORDER if name in BASE_STAGES or name in self.stages)
+
+    @property
+    def stages_source(self) -> str:
+        return self._stages_source
+
     @classmethod
-    def for_runner(cls, tp_rank: int) -> DeviceTiming:
+    def switches(cls, diag: Any, vllm_config: Any) -> tuple[tuple[str, ...], str, bool]:
+        """What this process measures beyond T51: (stages, where that came from, is this a decode node). A prefill
+        node -- or no way to tell -- measures none of it, whatever the environment says."""
+        stages, source = _parse_stages(os.environ.get(_ENV_STAGES))
+        if not _is_decode_node(diag, vllm_config):
+            return (), source, False
+        return stages, source, True
+
+    @classmethod
+    def for_runner(cls, tp_rank: int, vllm_config: Any = None) -> DeviceTiming:
         if tp_rank != 0:
             return cls(enabled=False)
         try:
@@ -68,6 +131,7 @@ class DeviceTiming:
             from vllm.v1.metrics import pd_diagnostics as diag
             from vllm.v1.worker.worker_base import pd_claim_finish
 
+            stages, source, decode = cls.switches(diag, vllm_config)
             npu = torch.npu
             return cls(
                 enabled=True,
@@ -76,6 +140,10 @@ class DeviceTiming:
                 capturing=npu.is_current_stream_capturing,
                 claim_finish=pd_claim_finish,
                 current_context=diag.current,
+                current_batch=diag.current_batch,
+                stages=stages,
+                stages_source=source,
+                decode_node=decode,
             )
         except Exception:  # no NPU events or no claim interface: host timing only
             return cls(enabled=False)
@@ -102,13 +170,14 @@ class DeviceTiming:
                 if slot is not None:
                     self._owner[slot] = step
                 step.claims["execute"] = claim
+                self._hold_batch_locked(step, "execute")
                 self._steps.append(step)
         except Exception:
             self._disable()
 
     @contextmanager
     def measure(self, stage: str):
-        """Around the target model call ("forward") or the sampler call ("sampling")."""
+        """Around the call this stage times. The two record() calls are what the step pays on the host for it."""
         pair = None
         if self.enabled:
             try:
@@ -141,6 +210,7 @@ class DeviceTiming:
                 claim = self._claim_finish()
                 if claim is not None:
                     step.claims["sample"] = claim
+                    self._hold_batch_locked(step, "sample")
         except Exception:
             self._disable()
 
@@ -185,6 +255,17 @@ class DeviceTiming:
         except Exception:
             return None
 
+    def _hold_batch_locked(self, step: _Step, phase: str) -> None:
+        """Keep this phase's open record, for the step's own fields (the claim only reaches the stages)."""
+        if not self.stages or self._current_batch is None:
+            return
+        try:
+            batch = self._current_batch()
+        except Exception:
+            return
+        if batch is not None:
+            step.batches[phase] = batch
+
     def _current_step_locked(self) -> _Step | None:
         if not self._steps:
             return None
@@ -217,23 +298,35 @@ class DeviceTiming:
         except Exception:
             pass
 
+    @staticmethod
+    def _duration_ns(start: Any, end: Any) -> int | None:
+        ms = start.elapsed_time(end)
+        if isinstance(ms, (int, float)) and not isinstance(ms, bool) and math.isfinite(ms) and ms >= 0:
+            return int(round(ms * 1_000_000))
+        return None
+
     def _collect_locked(self) -> None:
         while self._steps:
             step = self._steps[0]
             if not step.settled:
                 return
             values: dict[str, int] = {}
+            span_ns = None
             done = True
             if not step.broken and step.slot is not None:
                 try:
+                    events = self._events[step.slot]
                     for stage in sorted(step.recorded):
-                        start, end = self._events[step.slot][stage]
+                        start, end = events[stage]
                         if not (end.query() and start.query()):
                             done = False
                             break
-                        ms = start.elapsed_time(end)
-                        if isinstance(ms, (int, float)) and not isinstance(ms, bool) and math.isfinite(ms) and ms >= 0:
-                            values[stage] = int(round(ms * 1_000_000))
+                        value = self._duration_ns(start, end)
+                        if value is not None:
+                            values[stage] = value
+                    if done and _SPAN_FROM in step.recorded and _SPAN_TO in step.recorded:
+                        # The whole step on the device: the first stage's start event to the last one's end event.
+                        span_ns = self._duration_ns(events[_SPAN_FROM][0], events[_SPAN_TO][1])
                 except Exception:
                     step.broken = True
             if not done and not step.broken and self._seq - step.seq < SLOTS:
@@ -246,12 +339,26 @@ class DeviceTiming:
                             claim.set_stage_fields(stage, device_duration_ns=ns)
                         except Exception:
                             pass
+                if span_ns is not None:
+                    self._update_batch(step, "sample", step_device_span_ns=span_ns)
             self._release_locked(step)
+
+    @staticmethod
+    def _update_batch(step: _Step, phase: str, **fields: Any) -> None:
+        """A field on the step's own record. Ignored once that record has been written."""
+        batch = step.batches.get(phase)
+        if batch is None:
+            return
+        try:
+            batch.update(**fields)
+        except Exception:
+            pass
 
     def _release_locked(self, step: _Step) -> None:
         self._steps.popleft()
         if step.slot is not None and self._owner[step.slot] is step:
             self._owner[step.slot] = None
+        step.batches.clear()
         for phase in ("execute", "sample"):
             claim = step.claims.get(phase)
             if claim is not None:
@@ -269,6 +376,20 @@ class DeviceTiming:
 _DISABLED = DeviceTiming(enabled=False)
 
 
+def _is_decode_node(diag: Any, vllm_config: Any) -> bool:
+    """T56 convention 0.8: vllm-ascend's own condition, through the vLLM patch's shared function. Also requires the
+    four spans to be registered there, so an older vLLM patch leaves this at the T51 behaviour instead of a half-on
+    state (the Worker startup line then lists no runner_stages, which the upgrade check catches)."""
+    try:
+        is_pd_decode = getattr(diag, "is_pd_decode", None)
+        if is_pd_decode is None or not is_pd_decode(vllm_config):
+            return False
+        spans = getattr(diag, "_SPANS", {})
+        return all("runner." + name in spans for name in OPTIONAL_STAGES)
+    except Exception:
+        return False
+
+
 def _timing(runner, create: bool = False) -> DeviceTiming:
     timing = getattr(runner, "_pd_device_timing", None)
     if timing is not None or not create:
@@ -281,7 +402,7 @@ def _timing(runner, create: bool = False) -> DeviceTiming:
         return _DISABLED
     if tp_rank is None:  # outside a worker_summary step: decide later
         return _DISABLED
-    timing = DeviceTiming.for_runner(tp_rank)
+    timing = DeviceTiming.for_runner(tp_rank, getattr(runner, "vllm_config", None))
     try:
         runner._pd_device_timing = timing
     except Exception:
@@ -301,6 +422,56 @@ def measure(runner, stage: str):
         return _timing(runner).measure(stage)
     except Exception:
         return _DISABLED.measure(stage)
+
+
+@contextmanager
+def stage(runner, name: str):
+    """A T56 stage: the host span and the device events together, or nothing at all when this stage is off. Off is
+    the whole stage, so a node that does not measure it writes the same record as the T51 version."""
+    span = None
+    timing = _DISABLED
+    try:
+        timing = _timing(runner)
+        if name in timing.stages:
+            from vllm.v1.metrics import pd_diagnostics as diag
+
+            span = diag.span("runner." + name)
+    except Exception:
+        span = None
+    if span is None:
+        yield
+        return
+    measured = None
+    try:
+        measured = timing.measure(name)
+    except Exception:
+        measured = None
+    if measured is None:
+        with span:
+            yield
+        return
+    with span, measured:
+        yield
+
+
+def note_cudagraph_mode(runner, stats: Any = None, mode: Any = None) -> None:
+    """The graph mode this step's target model actually ran in, onto the open execute record. Same gate as the T56
+    stages, so a node that measures none of them writes the same record as the T51 version."""
+    try:
+        if not _timing(runner).stages:
+            return
+        value = getattr(stats, "runtime_mode", None)
+        if value is None:
+            value = getattr(mode, "name", None)
+        if value is None:
+            return
+        from vllm.v1.metrics import pd_diagnostics as diag
+
+        batch = diag.current_batch()
+        if batch is not None:
+            batch.update(cudagraph_runtime_mode=str(value))
+    except Exception:
+        pass
 
 
 def begin_sample(runner) -> None:
