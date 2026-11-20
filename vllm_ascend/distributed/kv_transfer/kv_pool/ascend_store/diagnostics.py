@@ -29,6 +29,27 @@ _ID_FIELDS = (
     "dcp_rank",
 )
 _active: contextvars.ContextVar[Task | None] = contextvars.ContextVar("pool_diagnostic_task", default=None)
+FULL_LEVEL = 3
+_level_read: list[int] = []
+
+
+def level() -> int:
+    """The granularity this process runs at, read once from the vLLM side: 3 records everything, 2 leaves out the
+    native call list, 1 also leaves out the stages above. A vLLM build that does not offer one leaves this at the
+    full level, so its behaviour is the one it had."""
+    if not _level_read:
+        value = FULL_LEVEL
+        try:
+            read = getattr(diag, "diag_level", None)
+            # It answers with (level, source); the source is for the line the vLLM side prints, not for here.
+            answer = FULL_LEVEL if read is None else read()
+            got = getattr(answer, "level", answer)
+            if isinstance(got, int) and not isinstance(got, bool) and 1 <= got <= FULL_LEVEL:
+                value = got
+        except Exception:
+            value = FULL_LEVEL
+        _level_read.append(value)
+    return _level_read[0]
 
 
 @dataclass(frozen=True)
@@ -154,13 +175,14 @@ class Task:
                 values = {dict(member).get(name) for member in self.members}
                 fields[name] = next(iter(values)) if len(values) == 1 and not self.members_dropped else None
         incomplete |= bool(self.members_dropped or self.native_calls_dropped or self.completions_dropped)
-        for name in _RETAINED_STAGES:
-            if name not in self.stages:
-                self.stages[name] = {
-                    "calls": 0,
-                    "status": ("skipped" if self.status in ("skipped", "no_task") else "unmeasured"),
-                    "exceptions": 0,
-                }
+        if level() >= 2:  # at the lowest granularity these stages are not timed, so they are not filled in either
+            for name in _RETAINED_STAGES:
+                if name not in self.stages:
+                    self.stages[name] = {
+                        "calls": 0,
+                        "status": ("skipped" if self.status in ("skipped", "no_task") else "unmeasured"),
+                        "exceptions": 0,
+                    }
         diag.emit(
             "pool_task",
             **fields,
@@ -236,7 +258,9 @@ def outcome(status: str) -> None:
 @contextmanager
 def stage(name: str):
     task = _active.get()
-    if task is None:
+    # Only the retained names reach the record's stages; at the lowest granularity none of them is timed at all.
+    retained = name in _RETAINED_STAGES
+    if task is None or (retained and level() < 2):
         yield
         return
     started = time.monotonic_ns()
@@ -250,7 +274,7 @@ def stage(name: str):
         raise
     finally:
         ended = time.monotonic_ns()
-        stages = task.stages if name in _RETAINED_STAGES else task.associated_stages
+        stages = task.stages if retained else task.associated_stages
         metric = stages.setdefault(
             name, {"calls": 0, "duration_ns": 0, "exceptions": 0, "start_ns": started, "end_ns": ended, "status": "ok"}
         )
@@ -394,7 +418,9 @@ def backend(operation: str, key_count: int, sizes: Any = None, mode: str = "zero
             add(**{operation + "_unknown_result_keys": key_count})
         # put/get are Python wrappers; native evidence belongs to the actual
         # Mooncake call nested inside them, never to a duplicate outer range.
-        if operation not in ("put", "get"):
+        # Below the full granularity the list is not kept; the counters it feeds are, so the
+        # task's own duration and its status read the same.
+        if operation not in ("put", "get") and level() >= FULL_LEVEL:
             if len(task.native_calls) < MAX_NATIVE_CALLS:
                 local = time.localtime(start_wall_ns // 1_000_000_000)
                 offset = getattr(local, "tm_gmtoff", -(time.altzone if local.tm_isdst > 0 else time.timezone))

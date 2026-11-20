@@ -49,6 +49,10 @@ _PHASE_OF_STAGE = {
 _ENV_STAGES = "VLLM_PD_DEVICE_STAGES"      # unset: all four; a comma-separated subset; "none": the two above only
 # The envelope of one step: the start of the first stage to the end of the last one.
 _SPAN_FROM, _SPAN_TO = "prepare_inputs", "draft"
+# Measured at every granularity, but its stage value goes into the record only at the full one. The device events
+# are recorded either way, so the envelope above and what a step costs on the device do not move with the level.
+_VALUE_AT_FULL_LEVEL_ONLY = ("bookkeeping",)
+FULL_LEVEL = 3
 
 
 def _parse_stages(raw: str | None) -> tuple[tuple[str, ...], str]:
@@ -80,7 +84,7 @@ class _Step:
 class DeviceTiming:
     def __init__(self, *, enabled: bool, new_event=None, current_stream=None, capturing=None, claim_finish=None,
                  current_context=None, current_batch=None, stages: tuple[str, ...] = (), stages_source: str = "default",
-                 decode_node: bool = False):
+                 decode_node: bool = False, level: int = FULL_LEVEL):
         self.enabled = enabled
         self._new_event = new_event
         self._current_stream = current_stream
@@ -90,6 +94,7 @@ class DeviceTiming:
         self._current_batch = current_batch
         self.decode_node = bool(decode_node) and enabled
         self.stages = frozenset(stages) if self.decode_node else frozenset()
+        self.level = level
         self._stages_source = stages_source
         self._lock = threading.Lock()
         self._steps: deque[_Step] = deque()
@@ -113,14 +118,22 @@ class DeviceTiming:
     def stages_source(self) -> str:
         return self._stages_source
 
+    def reports(self, name: str) -> bool:
+        """Whether this stage's value goes into the record. A stage this says no to is still measured: the host
+        span is not opened and the device value is not written, but both device events are recorded."""
+        return self.level >= FULL_LEVEL or name not in _VALUE_AT_FULL_LEVEL_ONLY
+
     @classmethod
-    def switches(cls, diag: Any, vllm_config: Any) -> tuple[tuple[str, ...], str, bool]:
+    def switches(cls, diag: Any, vllm_config: Any) -> tuple[tuple[str, ...], str, bool, int]:
         """What this process measures beyond the two base stages: (stages, where it came from, is this a decode
-        node). A prefill node -- or no way to tell -- measures none of it, whatever the environment says."""
+        node, the granularity). A prefill node -- or no way to tell -- measures none of it, whatever the
+        environment says. The granularity decides which measured stages reach the record, never which ones are
+        measured, so the stages here and the startup line read the same at every level."""
         stages, source = _parse_stages(os.environ.get(_ENV_STAGES))
+        level = _diag_level(diag)
         if not _is_decode_node(diag, vllm_config):
-            return (), source, False
-        return stages, source, True
+            return (), source, False, level
+        return stages, source, True, level
 
     @classmethod
     def for_runner(cls, tp_rank: int, vllm_config: Any = None) -> DeviceTiming:
@@ -131,7 +144,7 @@ class DeviceTiming:
             from vllm.v1.metrics import pd_diagnostics as diag
             from vllm.v1.worker.worker_base import pd_claim_finish
 
-            stages, source, decode = cls.switches(diag, vllm_config)
+            stages, source, decode, level = cls.switches(diag, vllm_config)
             npu = torch.npu
             return cls(
                 enabled=True,
@@ -144,6 +157,7 @@ class DeviceTiming:
                 stages=stages,
                 stages_source=source,
                 decode_node=decode,
+                level=level,
             )
         except Exception:  # no NPU events or no claim interface: host timing only
             return cls(enabled=False)
@@ -333,6 +347,8 @@ class DeviceTiming:
                 return  # not yet; a later read point takes it
             if done and not step.broken:
                 for stage, ns in values.items():
+                    if not self.reports(stage):
+                        continue
                     claim = step.claims.get(_PHASE_OF_STAGE[stage])
                     if claim is not None:
                         try:
@@ -374,6 +390,23 @@ class DeviceTiming:
 
 # ---- runner hooks: one call per site, never raising ------------------------------------------------------------------
 _DISABLED = DeviceTiming(enabled=False)
+
+
+def _diag_level(diag: Any) -> int:
+    """The granularity the vLLM side settled on, read once per process together with the stages. A vLLM patch that
+    does not offer one leaves this at the full level, so its behaviour is the one it had."""
+    try:
+        read = getattr(diag, "diag_level", None)
+        if read is None:
+            return FULL_LEVEL
+        answer = read()
+        # It answers with (level, source); the source is for the line the vLLM side prints, not for here.
+        value = getattr(answer, "level", answer)
+        if isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= FULL_LEVEL:
+            return value
+    except Exception:
+        pass
+    return FULL_LEVEL
 
 
 def _is_decode_node(diag: Any, vllm_config: Any) -> bool:
@@ -429,23 +462,24 @@ def stage(runner, name: str):
     """An optional stage: the host span and the device events together, or nothing at all when it is off. Off is
     the whole stage, so a node that does not measure it writes the same record as forward and sampling alone."""
     span = None
-    timing = _DISABLED
+    measured = None
     try:
         timing = _timing(runner)
         if name in timing.stages:
-            from vllm.v1.metrics import pd_diagnostics as diag
+            measured = timing.measure(name)
+            if timing.reports(name):
+                from vllm.v1.metrics import pd_diagnostics as diag
 
-            span = diag.span("runner." + name)
+                span = diag.span("runner." + name)
     except Exception:
         span = None
-    if span is None:
+    if span is None and measured is None:
         yield
         return
-    measured = None
-    try:
-        measured = timing.measure(name)
-    except Exception:
-        measured = None
+    if span is None:  # measured, but its value is not reported at this granularity
+        with measured:
+            yield
+        return
     if measured is None:
         with span:
             yield

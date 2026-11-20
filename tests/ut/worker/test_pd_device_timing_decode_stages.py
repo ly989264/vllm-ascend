@@ -110,7 +110,7 @@ class Side:
         return self.batches.setdefault(self.key(), Batch())
 
 
-def make(stages=pdt.OPTIONAL_STAGES, decode_node=True):
+def make(stages=pdt.OPTIONAL_STAGES, decode_node=True, level=pdt.FULL_LEVEL):
     device, side = Device(), Side()
     timing = pdt.DeviceTiming(
         enabled=True,
@@ -122,6 +122,7 @@ def make(stages=pdt.OPTIONAL_STAGES, decode_node=True):
         current_batch=side.current_batch,
         stages=stages,
         decode_node=decode_node,
+        level=level,
     )
     return timing, device, side
 
@@ -144,7 +145,7 @@ def run_step(timing, device, side, execution_id, durations, synchronous=True):
     timing.end_sample(read_now=synchronous)
 
 
-def install_fake_vllm(spans=True, is_decode=True, batch=None):
+def install_fake_vllm(spans=True, is_decode=True, batch=None, level=None):
     """The three vLLM names this module imports at call time. Returns (batch, calls, undo)."""
     saved = {name: sys.modules.get(name) for name in
              ("vllm", "vllm.v1", "vllm.v1.metrics", "vllm.v1.metrics.pd_diagnostics")}
@@ -162,6 +163,8 @@ def install_fake_vllm(spans=True, is_decode=True, batch=None):
     diag._SPANS = {"runner." + name: name for name in pdt.OPTIONAL_STAGES} if spans else {}
     if is_decode is not None:
         diag.is_pd_decode = lambda vllm_config=None: is_decode
+    if level is not None:
+        diag.diag_level = lambda: level
     metrics = types.ModuleType("vllm.v1.metrics")
     metrics.pd_diagnostics = diag
     v1 = types.ModuleType("vllm.v1")
@@ -270,19 +273,20 @@ class SwitchGateTest(unittest.TestCase):
         return sys.modules["vllm.v1.metrics.pd_diagnostics"]
 
     def test_decode_node_defaults_to_all_four(self):
-        self.assertEqual(pdt.DeviceTiming.switches(self.fake(), None), (pdt.OPTIONAL_STAGES, "default", True))
+        self.assertEqual(pdt.DeviceTiming.switches(self.fake(), None),
+                         (pdt.OPTIONAL_STAGES, "default", True, pdt.FULL_LEVEL))
 
     def test_decode_node_with_the_switch_set(self):
         os.environ[pdt._ENV_STAGES] = "draft"
-        self.assertEqual(pdt.DeviceTiming.switches(self.fake(), None), (("draft",), "env", True))
+        self.assertEqual(pdt.DeviceTiming.switches(self.fake(), None), (("draft",), "env", True, pdt.FULL_LEVEL))
 
     def test_prefill_node_measures_nothing_whatever_the_switch_says(self):
         os.environ[pdt._ENV_STAGES] = "prepare_inputs,lm_head,draft,bookkeeping"
-        stages, _, decode = pdt.DeviceTiming.switches(self.fake(is_decode=False), None)
+        stages, _, decode, _ = pdt.DeviceTiming.switches(self.fake(is_decode=False), None)
         self.assertEqual((stages, decode), ((), False))
 
     def test_an_older_vllm_patch_measures_nothing(self):
-        stages, _, decode = pdt.DeviceTiming.switches(self.fake(spans=False), None)
+        stages, _, decode, _ = pdt.DeviceTiming.switches(self.fake(spans=False), None)
         self.assertEqual((stages, decode), ((), False))
 
 
