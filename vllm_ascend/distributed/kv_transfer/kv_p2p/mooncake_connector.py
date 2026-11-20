@@ -155,6 +155,16 @@ def _pd_stage_end(req_meta: dict[str, Any], name: str | None = None, *, failed: 
             _pd_record_stage(task, key, started, ended, failed)
 
 
+def _pd_mark_request_done(req_meta: dict[str, Any]) -> None:
+    """Note when the task tracker marked the request done: the end of the KV-load envelope. Never raises."""
+    try:
+        task = _pd_task(req_meta)
+        if task is not None:
+            task["request_done_ns"] = time.monotonic_ns()
+    except Exception:
+        pass
+
+
 class RemotePortInfo(TypedDict):
     num: int
     host: str
@@ -699,6 +709,11 @@ class KVCacheRecvingThread(threading.Thread):
                     "failed_bytes": 0,
                     "transfer_start_ns": None,
                     "transfer_end_ns": None,
+                    "first_queued_ns": None,
+                    "request_done_ns": None,
+                    "task_max_queue_wait_ns": None,
+                    "task_max_meta_fetch_ns": None,
+                    "task_max_prepare_ns": None,
                     "tracker_completed": False,
                     "native_calls_dropped": 0,
                 }
@@ -922,6 +937,7 @@ class KVCacheRecvingThread(threading.Thread):
                             e,
                         )
                 self.task_tracker.update_done_task_count(request_id)
+                _pd_mark_request_done(req_meta)
                 with self.proc_not_transfer_request_lock:
                     self.proc_not_transfer_request.pop(remote_request_id, None)
                 self._clear_failed_recv_request(request_id)
@@ -981,6 +997,7 @@ class KVCacheRecvingThread(threading.Thread):
                 failed_bytes=task["failed_bytes"],
                 transfer_status=task["transfer_status"],
                 tracker_completed=tracker_completed,
+                request_done_ns=task.get("request_done_ns"),
                 native_calls=task["native_calls"],
                 native_calls_limit=MAX_TRANSFER_NATIVE_CALLS,
                 native_call_count=task["native_call_count"],
@@ -1001,6 +1018,19 @@ class KVCacheRecvingThread(threading.Thread):
                 for key in ("submitted_bytes", "succeeded_bytes", "failed_bytes"):
                     summary[key] += task[key]
                 summary["native_calls_dropped"] += task["native_calls_dropped"]
+                # Envelope ends and per-task maxima, merged under the same lock as the counts above.
+                if summary["first_queued_ns"] is None or task["queued_ns"] < summary["first_queued_ns"]:
+                    summary["first_queued_ns"] = task["queued_ns"]
+                if task.get("request_done_ns") is not None:
+                    summary["request_done_ns"] = task["request_done_ns"]
+                stages = task["associated_stages"]
+                for key, value in (
+                    ("task_max_queue_wait_ns", start_ns - task["queued_ns"]),
+                    ("task_max_meta_fetch_ns", (stages.get("meta_fetch") or {}).get("duration_ns")),
+                    ("task_max_prepare_ns", (stages.get("prepare") or {}).get("duration_ns")),
+                ):
+                    if value is not None and (summary[key] is None or value > summary[key]):
+                        summary[key] = value
                 if summary["pending_tasks"] == 0 and summary["final_task_queued"]:
                     completed = self.pd_request_tasks.pop(req_meta["request_id"])
             if completed is not None:
@@ -1016,7 +1046,7 @@ class KVCacheRecvingThread(threading.Thread):
                     **{
                         key: value
                         for key, value in completed.items()
-                        if key not in ("transfer_start_ns", "transfer_end_ns")
+                        if key not in ("transfer_start_ns", "transfer_end_ns", "first_queued_ns", "request_done_ns")
                     },
                     status=request_status,
                     scope="request_generation",
@@ -1034,6 +1064,12 @@ class KVCacheRecvingThread(threading.Thread):
                         else None
                     ),
                     timing_scope="native_read_envelope_not_task_sum_or_pure_wait",
+                    kv_load_envelope_ns=(
+                        completed["request_done_ns"] - completed["first_queued_ns"]
+                        if completed["request_done_ns"] is not None and completed["first_queued_ns"] is not None
+                        else None
+                    ),
+                    kv_load_timing_scope="first_task_queued_to_request_marked_done",
                     complete=not completed["native_calls_dropped"],
                     incomplete=bool(completed["native_calls_dropped"]),
                 )
