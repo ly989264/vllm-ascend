@@ -33,6 +33,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import async_tensor_h2d as async_copy_to_gpu
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
+from vllm.v1.metrics import pd_diagnostics as diag
 from vllm.v1.worker.dp_utils import skip_dp_coordination
 from vllm.v1.worker.gpu import model_runner as vllm_model_runner
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
@@ -50,6 +51,7 @@ from vllm.v1.worker.gpu.model_runner import (
     GPUModelRunner,
 )
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
+from vllm.v1.worker.worker_base import pd_execution, pd_sample
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import (
@@ -344,6 +346,7 @@ class NPUModelRunner(GPUModelRunner):
             pcp_manager._sampling_hidden_restored = True
         self.execute_model_state = state
 
+    @pd_sample
     def sample_tokens(self, grammar_output):
         if (
             lmhead_tp_enable()
@@ -591,6 +594,7 @@ class NPUModelRunner(GPUModelRunner):
             layer.impl.bind_copy_sfa_kv_cache(manager, layer_name)
 
     @torch.inference_mode()
+    @pd_execution
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,
@@ -1101,17 +1105,19 @@ class NPUModelRunner(GPUModelRunner):
 
         if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
             assert self.sampler is not None
-            sampler_output = self.sampler(logits, input_batch)
+            with diag.span("runner.sampling", algorithm="sampler", completion="host_return"):
+                sampler_output = self.sampler(logits, input_batch)
         else:
             # Rejection sampling for spec decoding.
             assert self.rejection_sampler is not None
             assert self.speculator is not None
-            sampler_output = self.rejection_sampler(
-                logits,
-                input_batch,
-                # Draft logits are needed for probabilistic rejection sampling.
-                self.speculator.draft_logits,
-            )
+            with diag.span("runner.sampling", algorithm="rejection", completion="host_return"):
+                sampler_output = self.rejection_sampler(
+                    logits,
+                    input_batch,
+                    # Draft logits are needed for probabilistic rejection sampling.
+                    self.speculator.draft_logits,
+                )
 
         return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected
 

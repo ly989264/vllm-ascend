@@ -38,6 +38,7 @@ from vllm.v1.engine import (
     EngineCoreOutputs,
     FinishReason,
 )
+from vllm.v1.metrics import pd_diagnostics as diag
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import record_function_or_nullcontext
@@ -178,6 +179,15 @@ class RecomputeScheduler(Scheduler):
         ]
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        # vLLM's own Scheduler.schedule() writes the [PD_DIAG] scheduler record around self._schedule(). Not
+        # super(): with BalanceScheduler as the base it would also run BalanceScheduler.schedule and the hooks on
+        # it, which this class never ran. Not imported by name: that name may be BalanceScheduler by now.
+        for cls in type(self).__mro__:
+            if cls.__module__ == "vllm.v1.core.sched.scheduler" and cls.__qualname__ == "Scheduler":
+                return cls.schedule(self, throttle_prefills)
+        raise RuntimeError("vLLM's Scheduler is not a base of this scheduler")
+
+    def _schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -478,6 +488,7 @@ class RecomputeScheduler(Scheduler):
                 assert request_queue is not None
 
                 request = request_queue.peek_request()
+                request.pd_queue_transition("candidate")
                 request_id = request.request_id
 
                 # try to promote blocked statuses while traversing skipped queue.
@@ -543,9 +554,33 @@ class RecomputeScheduler(Scheduler):
                         # sub-block tail without racing its copy-on-write.
                         partial_tail = num_new_local_computed_tokens % self.block_size
                         block_aligned_local = num_new_local_computed_tokens - partial_tail
-                        ext_tokens, load_kv_async = self.connector.get_num_new_matched_tokens(
-                            request, block_aligned_local
-                        )
+                        lookup_start = time.monotonic_ns()
+                        lookup_status = "ok"
+                        lookup_error = None
+                        try:
+                            ext_tokens, load_kv_async = self.connector.get_num_new_matched_tokens(
+                                request, block_aligned_local
+                            )
+                        except BaseException as exc:
+                            lookup_status = (
+                                "cancelled"
+                                if isinstance(exc, (KeyboardInterrupt, GeneratorExit))
+                                or type(exc).__name__ == "CancelledError"
+                                else "error"
+                            )
+                            lookup_error = type(exc).__name__
+                            raise
+                        finally:
+                            lookup_end = time.monotonic_ns()
+                            self._pd_external_lookup_ns += lookup_end - lookup_start
+                            self._pd_external_lookup_calls += 1
+                            diag.current_batch().add_stage(
+                                "lookup",
+                                start_ns=lookup_start,
+                                end_ns=lookup_end,
+                                status=lookup_status,
+                                error_type=lookup_error,
+                            )
 
                         if ext_tokens is None:
                             # The request cannot be scheduled because
@@ -818,6 +853,7 @@ class RecomputeScheduler(Scheduler):
                 if num_external_computed_tokens > 0:
                     # load_kv_async is False here
                     has_sync_kv_loads = True
+                request.pd_execution_id = diag.current().get("execution_id")
                 if self.log_stats:
                     request.record_event(EngineCoreEventType.SCHEDULED, scheduled_timestamp)
                 if request.status == RequestStatus.WAITING:
@@ -959,6 +995,7 @@ class RecomputeScheduler(Scheduler):
             scheduled_encoder_input_stats = self._make_scheduled_encoder_input_stats(scheduled_encoder_inputs)
 
         scheduler_output = RecomputeSchedulerOutput(
+            pd_execution_id=diag.current().get("execution_id"),
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
             num_scheduled_tokens=num_scheduled_tokens,
@@ -1003,6 +1040,42 @@ class RecomputeScheduler(Scheduler):
         # write KV and have their output processed later in update_from_output).
         if self.defer_block_free and total_num_scheduled_tokens > 0:
             self.sched_step_seq += 1
+
+        members = []
+        for request_id, scheduled_tokens in num_scheduled_tokens.items():
+            request = self.requests[request_id]
+            request.pd_execution_id = scheduler_output.pd_execution_id
+            request.pd_executions += 1
+            if scheduled_tokens > 0 and request.num_computed_tokens >= request.num_prompt_tokens:
+                request.pd_decode_steps += 1
+            members.append(
+                {
+                    "request_id": request_id,
+                    "observation_id": request.pd_identity.get("observation_id"),
+                    "engine_id": self._pd_engine_id,
+                    "scheduled_tokens": scheduled_tokens,
+                    "num_computed_tokens_before": request.num_computed_tokens,
+                    "num_output_tokens": request.num_output_tokens,
+                    "num_prompt_tokens": request.num_prompt_tokens,
+                    "num_tokens": request.num_tokens,
+                    "is_prefill_chunk": (
+                        request.num_computed_tokens + scheduled_tokens
+                        < request.num_tokens + request.num_output_placeholders
+                    ),
+                    "prefill_tokens_remaining_before": max(
+                        request.num_prompt_tokens - request.num_computed_tokens, 0
+                    ),
+                    "num_spec_tokens": len(scheduled_spec_decode_tokens.get(request_id, ())),
+                    "execution_participation": request.pd_executions,
+                }
+            )
+        diag.current_batch().update(
+            request_ids=list(num_scheduled_tokens),
+            members=members,
+            no_forward=total_num_scheduled_tokens == 0,
+            finished_request_ids=list(scheduler_output.finished_req_ids),
+            preempted_request_ids=[request.request_id for request in preempted_reqs],
+        )
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)

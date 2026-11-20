@@ -15,6 +15,7 @@ from vllm.v1.core.kv_cache_utils import BlockHash, BlockHashList
 from vllm.v1.kv_cache_interface import FullAttentionSpec, UniformTypeKVCacheSpecs
 
 from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import diagnostics as pool_diag
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import AttentionComputeStartGate
 
 
@@ -480,6 +481,7 @@ class ChunkedTokenDatabase:
             self.group_block_stride.get(kv_cache_group_id),
         )
 
+    @pool_diag.timed("prepare")
     def prepare_value(
         self,
         start: int,
@@ -510,6 +512,7 @@ class ChunkedTokenDatabase:
             size_list.append(size)
         return addr_list, size_list, block_id
 
+    @pool_diag.timed("prepare")
     def prepare_value_layer(self, start: int, end: int, block_ids: list[int], layer_id: int):
         group_block_size = self.get_block_size(0)
         block_idx = start // group_block_size
@@ -594,6 +597,7 @@ class ChunkedTokenDatabase:
                 continue
             yield start_idx, end_idx, grouped_hashes[chunk_id], block_id
 
+    @pool_diag.timed_iterator("build_key")
     def process_tokens(
         self,
         token_len: int,
@@ -644,6 +648,7 @@ class ChunkedTokenDatabase:
         ):
             yield start, end, prefix + block_hash_to_str(hash_val), hash_val
 
+    @pool_diag.timed_iterator("build_key")
     def process_token_key_strings_with_block_ids(
         self,
         token_len: int,
@@ -1006,6 +1011,7 @@ class ReqMeta:
     original_block_size: list[int] | int | None = None
 
     event_id: int | None = None
+    pd_execution_id: str | None = None
 
     def __init__(
         self,
@@ -1046,6 +1052,7 @@ class ReqMeta:
         load_key_block_offset: int = 0,
         load_last_block_key: str | None = None,
         load_keys: list[str] | None = None,
+        pd_execution_id: str | None = None,
     ) -> None:
         if token_len_chunk is None:
             token_len_chunk = 0 if save_end_token is None else save_end_token
@@ -1068,6 +1075,7 @@ class ReqMeta:
         self.token_ids = token_ids
         self.original_block_size = original_block_size
         self.event_id = event_id
+        self.pd_execution_id = pd_execution_id
         self.last_block_gva = last_block_gva
         self.partial_block_index = partial_block_index
         self.block_ids_np = block_ids_np
@@ -1257,8 +1265,10 @@ class AscendConnectorMetadata(KVConnectorMetadata):
         self,
         preempted_req_ids,
         loading_req_ids: set[str] | None = None,
+        pd_execution_id: str | None = None,
     ):
         self.requests: list[ReqMeta] = []
+        self.pd_execution_id = pd_execution_id
         self.preempted_req_ids = preempted_req_ids
         self.loading_req_ids = loading_req_ids or set()
         # Requests whose blocks became reusable since the previous step
@@ -1267,6 +1277,8 @@ class AscendConnectorMetadata(KVConnectorMetadata):
 
     def add_request(self, req_meta: ReqMeta) -> None:
         """Add a request to the metadata."""
+        if req_meta.pd_execution_id is None:
+            req_meta.pd_execution_id = self.pd_execution_id
         self.requests.append(req_meta)
 
 

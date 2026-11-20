@@ -85,6 +85,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.metrics import pd_diagnostics as diag
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
@@ -118,6 +119,7 @@ from vllm.v1.worker.utils import (
     prepare_kernel_block_sizes,
     raise_if_nan_logits,
 )
+from vllm.v1.worker.worker_base import pd_execution, pd_sample
 
 # yapf: enable
 from vllm_ascend.ascend_config import get_ascend_config
@@ -238,6 +240,7 @@ from vllm_ascend.worker.device_metadata import (
     DeviceMetadataTaskProvider,
 )
 from vllm_ascend.worker.kvpp_cache import allocate_kvpp_cache
+from vllm_ascend.worker import pd_device_timing
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.utils import (
     AscendKVBlockZeroer,
@@ -2224,6 +2227,7 @@ class NPUModelRunner(GPUModelRunner):
         return cut_tokens
 
     @torch.inference_mode()
+    @pd_execution
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -2237,6 +2241,7 @@ class NPUModelRunner(GPUModelRunner):
         )
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
+        pd_device_timing.begin_execute(self)
 
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.
@@ -2760,6 +2765,7 @@ class NPUModelRunner(GPUModelRunner):
         self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
 
     @torch.inference_mode()
+    @pd_sample
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
@@ -2781,6 +2787,7 @@ class NPUModelRunner(GPUModelRunner):
             output.kv_connector_output = kv_connector_output
             return output
 
+        pd_device_timing.begin_sample(self)
         # Unpack ephemeral state.
         (
             scheduler_output,
@@ -2950,10 +2957,11 @@ class NPUModelRunner(GPUModelRunner):
                 self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
 
         if not self.use_async_scheduling:
+            pd_device_timing.end_sample(self, read_now=True)
             return model_runner_output
 
         # R3 is served by the V2 runner through vLLM's AuxOutput connector.
-        async_output = AsyncGPUModelRunnerOutput(
+        async_output = pd_device_timing.async_output_class(AsyncGPUModelRunnerOutput)(
             model_runner_output=model_runner_output,
             sampled_token_ids=sampler_output.sampled_token_ids,
             logprobs_tensors=sampler_output.logprobs_tensors,
@@ -2966,6 +2974,7 @@ class NPUModelRunner(GPUModelRunner):
             async_output.sampled_token_ids_cpu,
             async_output.async_copy_ready_event,
         )
+        pd_device_timing.end_sample(self, read_now=False, async_output=async_output)
         return async_output
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
@@ -2976,20 +2985,28 @@ class NPUModelRunner(GPUModelRunner):
         if spec_decode_metadata is None:
             if lmhead_tp_enable() and logits is not None:
                 logits = logits[: self.input_batch.num_reqs]
-            return self.sampler(
-                logits=logits,
-                sampling_metadata=sampling_metadata,
-            )
+            with (
+                diag.span("runner.sampling", algorithm="sampler", completion="host_return"),
+                pd_device_timing.measure(self, "sampling"),
+            ):
+                return self.sampler(
+                    logits=logits,
+                    sampling_metadata=sampling_metadata,
+                )
 
         if lmhead_tp_enable() and logits is not None:
             logits = logits[: len(spec_decode_metadata.logits_indices)]
         draft_probs = self._get_spec_decode_draft_probs(spec_decode_metadata)
-        sampler_output = self.rejection_sampler(
-            spec_decode_metadata,
-            draft_probs,
-            logits,
-            sampling_metadata,
-        )
+        with (
+            diag.span("runner.sampling", algorithm="rejection", completion="host_return"),
+            pd_device_timing.measure(self, "sampling"),
+        ):
+            sampler_output = self.rejection_sampler(
+                spec_decode_metadata,
+                draft_probs,
+                logits,
+                sampling_metadata,
+            )
         return sampler_output
 
     def _get_nans_in_logits(self, logits: torch.Tensor | None) -> dict[str, int]:
@@ -3244,9 +3261,17 @@ class NPUModelRunner(GPUModelRunner):
             if self.enable_enpu:
                 # The soft segmentation scenario requires event.record first, then event.wait
                 self._update_full_graph_params_if_needed(forward_context, num_tokens_padded)
-                hidden_states = run_model()
+                with (
+                    diag.span("runner.forward", completion="host_return"),
+                    pd_device_timing.measure(self, "forward"),
+                ):
+                    hidden_states = run_model()
             else:
-                hidden_states = run_model()
+                with (
+                    diag.span("runner.forward", completion="host_return"),
+                    pd_device_timing.measure(self, "forward"),
+                ):
+                    hidden_states = run_model()
                 self._update_full_graph_params_if_needed(forward_context, num_tokens_padded)
         finally:
             # A forward that raises must still retire the device-metadata
