@@ -1,4 +1,4 @@
-"""Each Pool measurement point records exactly the work it names (glm5.3 / d4ad49796).
+"""Each Pool measurement point records exactly the work it names (vllm-ascend d4ad49796).
 
 The code under test is the real ChunkedTokenDatabase timing wrappers, KVCacheStoreSendingThread,
 KVPoolWorker, AscendStoreConnector and MooncakeBackend; only the Mooncake store object, NPU events
@@ -180,7 +180,7 @@ def metadata(execution_id, *requests):
 
 
 class TestSyncLoadRecords(unittest.TestCase):
-    """glm5.3 P (load_async=false): start_load_kv writes one pool_task[load] per request (C11)."""
+    """A prefill node with load_async=false: start_load_kv writes one pool_task[load] per request."""
 
     def test_each_request_is_one_load_task_that_contains_its_own_get(self):
         native = FakeNative(get_ms=10)
@@ -299,7 +299,7 @@ class TestSyncLoadRecords(unittest.TestCase):
         overhead = submit["duration_ns"] - total
         print(
             f"\nsync-load step: submit={submit['duration_ns'] / MS:.3f} ms, sum(all tasks)={total / MS:.3f} ms, "
-            f"sum(C11 statuses)={loaded / MS:.3f} ms, outside tasks={overhead / MS:.3f} ms, requests={len(tasks)}"
+            f"sum(selected statuses)={loaded / MS:.3f} ms, outside tasks={overhead / MS:.3f} ms, requests={len(tasks)}"
         )
         # Every task lies inside the step's submit span, so the tasks can never add up to more.
         self.assertGreaterEqual(overhead, 0)

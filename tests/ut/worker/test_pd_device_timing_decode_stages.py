@@ -1,7 +1,7 @@
-"""Stdlib-only tests for the T56 part of vllm_ascend/worker/pd_device_timing.py.
+"""Stdlib-only tests for the optional decode-node stages of vllm_ascend/worker/pd_device_timing.py.
 
-T51 measured two stages per step; T56 adds four more and makes them switchable, so that a prefill node -- and a
-decode node with the switch off -- writes exactly what the T51 version wrote. The device events are stubs on a
+Two stages per step are always measured; four more are optional and switchable, so that a prefill node -- and a
+decode node with the switch off -- writes exactly what those two alone wrote. The device events are stubs on a
 scripted timeline, as in test_pd_device_timing.py; the vLLM side (pd_diagnostics, forward context) is a fake module
 installed into sys.modules, because the helper imports it at call time.
 """
@@ -17,7 +17,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
-spec = importlib.util.spec_from_file_location("pd_device_timing_t56_ut", ROOT / "vllm_ascend/worker/pd_device_timing.py")
+spec = importlib.util.spec_from_file_location("pd_device_timing_stages_ut", ROOT / "vllm_ascend/worker/pd_device_timing.py")
 pdt = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(pdt)
 MS = 1_000_000
@@ -127,7 +127,7 @@ def make(stages=pdt.OPTIONAL_STAGES, decode_node=True):
 
 
 def run_step(timing, device, side, execution_id, durations, synchronous=True):
-    """One step in the order the runner measures: the four T56 stages only when they are on."""
+    """One step in the order the runner measures: the four optional stages only when they are on."""
     side.context.update(execution_id=execution_id, phase="execute")
     timing.begin_execute()
     for phase, name in STEP_ORDER:
@@ -192,7 +192,7 @@ class SwitchTest(unittest.TestCase):
     def test_unset_means_all_four_stages(self):
         self.assertEqual(pdt._parse_stages(None), (pdt.OPTIONAL_STAGES, "default"))
 
-    def test_none_goes_back_to_the_t51_behaviour(self):
+    def test_none_goes_back_to_the_base_behaviour(self):
         self.assertEqual(pdt._parse_stages("none"), ((), "env"))
         self.assertEqual(pdt._parse_stages("NONE"), ((), "env"))
         self.assertEqual(pdt._parse_stages(" none , lm_head "), ((), "env"))
@@ -214,7 +214,7 @@ class SwitchTest(unittest.TestCase):
         # Switched off on a decode node: the line still says so.
         off, _, _ = make(stages=())
         self.assertEqual(off.runner_stages, ("forward", "sampling"))
-        # Not a decode node (a prefill node, or no way to tell): nothing on the line, as in T51.
+        # Not a decode node (a prefill node, or no way to tell): nothing on the line, as in the base behaviour.
         not_decode, _, _ = make(stages=pdt.OPTIONAL_STAGES, decode_node=False)
         self.assertEqual(not_decode.runner_stages, ())
         self.assertEqual(not_decode.stages, frozenset())
@@ -320,7 +320,7 @@ class SixStageTest(unittest.TestCase):
         self.assertEqual(sorted(self.values(side, "e1", "execute")), ["forward", "lm_head"])
         self.assertEqual(sorted(self.values(side, "e1", "sample")), ["sampling"])
 
-    def test_with_every_stage_off_the_records_are_what_t51_wrote(self):
+    def test_with_every_stage_off_the_records_are_what_the_base_wrote(self):
         timing, device, side = make(stages=())
         self.assertEqual(timing.runner_stages, ("forward", "sampling"))  # the line still marks it a decode node
         run_step(timing, device, side, "e1", {name: 1 for _, name in STEP_ORDER})

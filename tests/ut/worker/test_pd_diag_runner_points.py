@@ -275,8 +275,8 @@ class RunnerPlacementTest(unittest.TestCase):
         # V2 keeps host timing only.
         self.assertNotIn("pd_device_timing", V2.read_text(encoding="utf-8"))
 
-    def test_v1_t56_stage_points(self):
-        """The four T56 stages: one block each, around the calls the segment is defined as."""
+    def test_v1_optional_stage_points(self):
+        """The four optional stages: one block each, around the calls the segment is defined as."""
         v1 = runner_methods(V1)
         blocks = {name: stage_blocks(v1[name]) for name in ("execute_model", "sample_tokens")}
         self.assertEqual(sorted(blocks["execute_model"]), ["lm_head", "prepare_inputs"])
@@ -313,10 +313,10 @@ class RunnerPlacementTest(unittest.TestCase):
         # The graph mode of the step, once, next to where the runner works it out.
         self.assertEqual(len(call_spans(v1["execute_model"], "pd_device_timing.note_cudagraph_mode")), 1)
 
-    def test_v1_t56_stages_are_not_on_the_dummy_paths(self):
+    def test_v1_optional_stages_are_not_on_the_dummy_paths(self):
         v1 = runner_methods(V1)
         for name in ("_dummy_run", "_dummy_sampler_run", "profile_run", "capture_model"):
-            self.assertEqual(stage_blocks(v1[name]), {}, f"{name} must not measure a T56 stage")
+            self.assertEqual(stage_blocks(v1[name]), {}, f"{name} must not measure an optional stage")
             self.assertEqual(call_spans(v1[name], "pd_device_timing.note_cudagraph_mode"), [])
 
     def test_imports_name_the_vllm_patch_symbols(self):
@@ -394,7 +394,7 @@ def device_timing(phase_box):
 
 
 class RunnerDeviceEventTest(unittest.TestCase):
-    """The device events of C14 sit on the compute stream right around the same calls as the host spans."""
+    """The device events sit on the compute stream right around the same calls as the host spans."""
 
     def test_v1_forward_events_bracket_only_the_target_model_call(self):
         namespace = dict(FORWARD_NAMESPACE)

@@ -2,7 +2,7 @@
 
 The NPU events are stubs on a scripted device timeline: the test advances device time inside the measured calls and
 decides which events have completed, so every device value is exact and nothing depends on machine load. The record
-claims follow vLLM's pd_claim_finish() interface (docs/A2_INTERFACE.zh-CN.md of the T51 kit).
+claims follow vLLM's pd_claim_finish() interface: the record stays open until the timing releases it.
 """
 
 from __future__ import annotations

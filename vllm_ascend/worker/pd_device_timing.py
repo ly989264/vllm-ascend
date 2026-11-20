@@ -6,11 +6,11 @@ model call ("forward") and around the sampler call ("sampling"). The step's two 
 events are read; the value goes into stages.<name> as device_duration_ns, next to the unchanged host duration_ns.
 Reading never waits: query() both events first, elapsed_time() only when both completed.
 
-T56 adds four more stages around the rest of the step -- "prepare_inputs", "lm_head" (execute), "draft",
+Four optional stages cover the rest of the step -- "prepare_inputs", "lm_head" (execute), "draft",
 "bookkeeping" (sample) -- through stage(), which opens the host span and the device events together. They are
-written only on a PD decode node (is_pd_decode(), T56 convention 0.8) and only for the stages VLLM_PD_DEVICE_STAGES
-leaves on, so a prefill node's records stay byte-identical to the T51 version. The six stages run one after another
-on the same compute stream, so their device intervals do not overlap and may be summed.
+written only on a PD decode node (is_pd_decode()) and only for the stages VLLM_PD_DEVICE_STAGES leaves on, so a
+prefill node's records stay byte-identical to what forward and sampling alone wrote. The six stages run one after
+another on the same compute stream, so their device intervals do not overlap and may be summed.
 
 Where the events are read:
   - synchronous runs (P): when sample_tokens returns; the sampled tokens were already copied to the host there;
@@ -34,9 +34,9 @@ from typing import Any
 SLOTS = 4  # event pairs kept per stage; also the number of steps a read may lag
 # The order the stages run in within one step; also the order the startup line lists them.
 STAGE_ORDER = ("forward", "sampling", "prepare_inputs", "lm_head", "draft", "bookkeeping")
-# T51 measures these two unconditionally; VLLM_PD_DEVICE_STAGES never touches them.
+# These two are always measured; VLLM_PD_DEVICE_STAGES never touches them.
 BASE_STAGES = ("forward", "sampling")
-# T56 adds these; each one can be switched off, and all of them are off unless this is a decode node.
+# These are optional; each one can be switched off, and all of them are off unless this is a decode node.
 OPTIONAL_STAGES = ("prepare_inputs", "lm_head", "draft", "bookkeeping")
 _PHASE_OF_STAGE = {
     "forward": "execute",
@@ -46,7 +46,7 @@ _PHASE_OF_STAGE = {
     "draft": "sample",
     "bookkeeping": "sample",
 }
-_ENV_STAGES = "VLLM_PD_DEVICE_STAGES"      # unset: all four; a comma-separated subset; "none": back to T51
+_ENV_STAGES = "VLLM_PD_DEVICE_STAGES"      # unset: all four; a comma-separated subset; "none": the two above only
 # The envelope of one step: the start of the first stage to the end of the last one.
 _SPAN_FROM, _SPAN_TO = "prepare_inputs", "draft"
 
@@ -102,9 +102,9 @@ class DeviceTiming:
     @property
     def runner_stages(self) -> tuple[str, ...]:
         """What the Worker startup line lists, in step order. Empty on anything but a decode node, so the line --
-        and the records -- stay byte-identical to the T51 version there. On a decode node it always lists at least
-        forward and sampling, so "switched off here" (forward,sampling) reads differently from "not a decode node"
-        (no runner_stages on the line at all)."""
+        and the records -- stay byte-identical to forward and sampling alone there. On a decode node it always
+        lists at least forward and sampling, so "switched off here" (forward,sampling) reads differently from
+        "not a decode node" (no runner_stages on the line at all)."""
         if not self.decode_node:
             return ()
         return tuple(name for name in STAGE_ORDER if name in BASE_STAGES or name in self.stages)
@@ -115,8 +115,8 @@ class DeviceTiming:
 
     @classmethod
     def switches(cls, diag: Any, vllm_config: Any) -> tuple[tuple[str, ...], str, bool]:
-        """What this process measures beyond T51: (stages, where that came from, is this a decode node). A prefill
-        node -- or no way to tell -- measures none of it, whatever the environment says."""
+        """What this process measures beyond the two base stages: (stages, where it came from, is this a decode
+        node). A prefill node -- or no way to tell -- measures none of it, whatever the environment says."""
         stages, source = _parse_stages(os.environ.get(_ENV_STAGES))
         if not _is_decode_node(diag, vllm_config):
             return (), source, False
@@ -377,8 +377,8 @@ _DISABLED = DeviceTiming(enabled=False)
 
 
 def _is_decode_node(diag: Any, vllm_config: Any) -> bool:
-    """T56 convention 0.8: vllm-ascend's own condition, through the vLLM patch's shared function. Also requires the
-    four spans to be registered there, so an older vLLM patch leaves this at the T51 behaviour instead of a half-on
+    """vllm-ascend's own condition, reached through the shared function on the vLLM side. Also requires the four
+    spans to be registered there, so an older vLLM side leaves this at the base behaviour instead of a half-on
     state (the Worker startup line then lists no runner_stages, which the upgrade check catches)."""
     try:
         is_pd_decode = getattr(diag, "is_pd_decode", None)
@@ -426,8 +426,8 @@ def measure(runner, stage: str):
 
 @contextmanager
 def stage(runner, name: str):
-    """A T56 stage: the host span and the device events together, or nothing at all when this stage is off. Off is
-    the whole stage, so a node that does not measure it writes the same record as the T51 version."""
+    """An optional stage: the host span and the device events together, or nothing at all when it is off. Off is
+    the whole stage, so a node that does not measure it writes the same record as forward and sampling alone."""
     span = None
     timing = _DISABLED
     try:
@@ -455,8 +455,8 @@ def stage(runner, name: str):
 
 
 def note_cudagraph_mode(runner, stats: Any = None, mode: Any = None) -> None:
-    """The graph mode this step's target model actually ran in, onto the open execute record. Same gate as the T56
-    stages, so a node that measures none of them writes the same record as the T51 version."""
+    """The graph mode this step's target model actually ran in, onto the open execute record. Same gate as the optional
+    stages, so a node that measures none of them writes the same record as forward and sampling alone."""
     try:
         if not _timing(runner).stages:
             return
