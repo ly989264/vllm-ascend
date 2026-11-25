@@ -31,6 +31,7 @@ from vllm.v1.kv_cache_interface import (
 
 from vllm_ascend.ascend_config import KVPPConfig
 from vllm_ascend.core.kv_cache_placement import map_kvpp_layers_to_owners
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import diagnostics as pool_diag
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import (
     get_attention_compute_start_gate,
     reset_attention_compute_start_gate,
@@ -1259,153 +1260,159 @@ class KVPoolWorker:
         if len(metadata.requests) == 0:
             return
         for request in metadata.requests:
-            load_spec = request.load_spec
-            if load_spec is None or not load_spec.can_load:  # load =0
-                logger.debug(
-                    "KV pool worker skip get req=%s reason=%s",
-                    request.req_id,
-                    "no_load_spec" if load_spec is None else f"can_load={load_spec.can_load}",
-                )
-                continue
-            request.skip_null_blocks_by_group = self.group_uses_align_state
-            load_group_ids = request.kv_cache_group_ids or [0]
-            token_len = request.token_len_chunk
-            if (load_spec.kvpool_cached_tokens % self.cache_transfer_granularity != 0) and (
-                load_spec.kvpool_cached_tokens == token_len - 1
+            with pool_diag.processing(
+                pool_diag.capture(request, "load_submit" if self.load_async else "load", self.tp_rank, queued=False)
             ):
-                token_len = load_spec.kvpool_cached_tokens + 1
-            else:
-                token_len = load_spec.kvpool_cached_tokens
-            load_spec.token_len = token_len
-            logger.debug(
-                "KV pool worker prepare get req=%s token_len_chunk=%d get_token_len=%d "
-                "vllm_cached=%d kvpool_cached=%d groups=%s load_async=%s",
-                request.req_id,
-                request.token_len_chunk,
-                token_len,
-                load_spec.vllm_cached_tokens,
-                load_spec.kvpool_cached_tokens,
-                load_group_ids,
-                self.load_async,
-            )
-            if self.load_async:
-                self.kv_recv_thread.add_request(  # type: ignore[union-attr]
-                    request,
-                )
-                continue
-
-            if self.tp_mismatch:
-                # TP mismatch is restricted to non-hybrid, single-group KV.
-                group_block_size = self.grouped_block_size[0]
-                mask_num = load_spec.vllm_cached_tokens // group_block_size * group_block_size
-                self._load_kv_tp_mismatch(
-                    request.block_hashes,
-                    request.block_ids_by_group[0],
-                    token_len,
-                    mask_num,
-                )
-                continue
-
-            addr_list = []
-            size_list = []
-            key_list = []
-            block_id_list: list[int] = []
-            load_masks = self.token_database.load_mask(request.block_hashes, token_len)
-            for group_id in load_group_ids:
-                if group_id >= len(request.block_ids_by_group):
+                load_spec = request.load_spec
+                if load_spec is None or not load_spec.can_load:  # load =0
+                    pool_diag.outcome("missing_load_spec" if load_spec is None else "skipped")
+                    logger.debug(
+                        "KV pool worker skip get req=%s reason=%s",
+                        request.req_id,
+                        "no_load_spec" if load_spec is None else f"can_load={load_spec.can_load}",
+                    )
                     continue
-                block_ids = request.block_ids_by_group[group_id]
-                group_block_size = self.grouped_block_size[group_id]
-                mask_num = load_spec.vllm_cached_tokens // group_block_size * group_block_size
-                skip_null = group_id < len(self.group_uses_align_state) and self.group_uses_align_state[group_id]
-
-                def chunk_filter(start: int, group_id=group_id, load_masks=load_masks) -> bool:
-                    return self.token_database.mask_allows_chunk(load_masks, group_id, start)
-
-                for (
-                    start,
-                    end,
-                    key,
-                    _block_hash,
-                    block_id,
-                ) in self.token_database.process_token_key_strings_with_block_ids(
-                    token_len,
-                    request.block_hashes,
-                    block_ids,
-                    mask_num,
-                    kv_cache_group_id=group_id,
-                    skip_null_blocks=skip_null,
-                    chunk_filter=chunk_filter,
+                request.skip_null_blocks_by_group = self.group_uses_align_state
+                load_group_ids = request.kv_cache_group_ids or [0]
+                token_len = request.token_len_chunk
+                if (load_spec.kvpool_cached_tokens % self.cache_transfer_granularity != 0) and (
+                    load_spec.kvpool_cached_tokens == token_len - 1
                 ):
-                    addr, size, block_id = self.token_database.prepare_value(
+                    token_len = load_spec.kvpool_cached_tokens + 1
+                else:
+                    token_len = load_spec.kvpool_cached_tokens
+                load_spec.token_len = token_len
+                logger.debug(
+                    "KV pool worker prepare get req=%s token_len_chunk=%d get_token_len=%d "
+                    "vllm_cached=%d kvpool_cached=%d groups=%s load_async=%s",
+                    request.req_id,
+                    request.token_len_chunk,
+                    token_len,
+                    load_spec.vllm_cached_tokens,
+                    load_spec.kvpool_cached_tokens,
+                    load_group_ids,
+                    self.load_async,
+                )
+                if self.load_async:
+                    self.kv_recv_thread.add_request(  # type: ignore[union-attr]
+                        request,
+                    )
+                    pool_diag.outcome("submission_returned")
+                    continue
+
+                if self.tp_mismatch:
+                    # TP mismatch is restricted to non-hybrid, single-group KV.
+                    group_block_size = self.grouped_block_size[0]
+                    mask_num = load_spec.vllm_cached_tokens // group_block_size * group_block_size
+                    self._load_kv_tp_mismatch(
+                        request.block_hashes,
+                        request.block_ids_by_group[0],
+                        token_len,
+                        mask_num,
+                    )
+                    continue
+
+                addr_list = []
+                size_list = []
+                key_list = []
+                block_id_list: list[int] = []
+                load_masks = self.token_database.load_mask(request.block_hashes, token_len)
+                for group_id in load_group_ids:
+                    if group_id >= len(request.block_ids_by_group):
+                        continue
+                    block_ids = request.block_ids_by_group[group_id]
+                    group_block_size = self.grouped_block_size[group_id]
+                    mask_num = load_spec.vllm_cached_tokens // group_block_size * group_block_size
+                    skip_null = group_id < len(self.group_uses_align_state) and self.group_uses_align_state[group_id]
+
+                    def chunk_filter(start: int, group_id=group_id, load_masks=load_masks) -> bool:
+                        return self.token_database.mask_allows_chunk(load_masks, group_id, start)
+
+                    for (
                         start,
                         end,
+                        key,
+                        _block_hash,
+                        block_id,
+                    ) in self.token_database.process_token_key_strings_with_block_ids(
+                        token_len,
+                        request.block_hashes,
                         block_ids,
+                        mask_num,
                         kv_cache_group_id=group_id,
-                        block_id=block_id,
-                    )
-                    key_list.append(key)
-                    addr_list.append(addr)
-                    size_list.append(size)
-                    block_id_list.append(block_id)
-            if not key_list:
-                continue
-            key_list_c = _circular_shift(key_list, self.tp_rank % len(key_list))
-            addr_list_c = _circular_shift(addr_list, self.tp_rank % len(addr_list))
-            size_list_c = _circular_shift(size_list, self.tp_rank % len(size_list))
-            block_id_list_c = _circular_shift(block_id_list, self.tp_rank % len(block_id_list))
-            logger.debug(
-                "KV pool worker calls backend get request=%s token_len=%d groups=%s keys=%d sample_keys=%s",
-                request.req_id,
-                token_len,
-                load_group_ids,
-                len(key_list_c),
-                key_list_c[:3],
-            )
-            load_get_start = time.perf_counter()
-            ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
-            self._record_kv_connector_operation(
-                "load_get",
-                time.perf_counter() - load_get_start,
-                len(key_list_c),
-            )
-            if ret is not None and any(r != 0 for r in ret):
-                missing_block_ids = record_failed_blocks(
-                    block_id_list_c,
-                    ret,
+                        skip_null_blocks=skip_null,
+                        chunk_filter=chunk_filter,
+                    ):
+                        addr, size, block_id = self.token_database.prepare_value(
+                            start,
+                            end,
+                            block_ids,
+                            kv_cache_group_id=group_id,
+                            block_id=block_id,
+                        )
+                        key_list.append(key)
+                        addr_list.append(addr)
+                        size_list.append(size)
+                        block_id_list.append(block_id)
+                if not key_list:
+                    pool_diag.outcome("no_task")
+                    continue
+                key_list_c = _circular_shift(key_list, self.tp_rank % len(key_list))
+                addr_list_c = _circular_shift(addr_list, self.tp_rank % len(addr_list))
+                size_list_c = _circular_shift(size_list, self.tp_rank % len(size_list))
+                block_id_list_c = _circular_shift(block_id_list, self.tp_rank % len(block_id_list))
+                logger.debug(
+                    "KV pool worker calls backend get request=%s token_len=%d groups=%s keys=%d sample_keys=%s",
+                    request.req_id,
+                    token_len,
+                    load_group_ids,
+                    len(key_list_c),
+                    key_list_c[:3],
                 )
-                if len(request.block_ids_by_group) == 1:
-                    self._invalid_block_ids.update(missing_block_ids)
-                elif missing_block_ids:
-                    logger.error(
-                        "KV load failed for hybrid request %s. "
-                        "Skip invalid-block fallback to avoid scheduler crash. "
-                        "failed_blocks=%s",
-                        request.req_id,
-                        missing_block_ids,
-                    )
-            elif ret is None:
-                missing_block_ids = record_failed_blocks(
-                    block_id_list_c,
-                    [1] * len(block_id_list_c),
+                load_get_start = time.perf_counter()
+                ret = pool_diag.get(self.m_store, key_list_c, addr_list_c, size_list_c)
+                self._record_kv_connector_operation(
+                    "load_get",
+                    time.perf_counter() - load_get_start,
+                    len(key_list_c),
                 )
-                if len(request.block_ids_by_group) == 1:
-                    self._invalid_block_ids.update(missing_block_ids)
-                elif missing_block_ids:
-                    logger.error(
-                        "KV load failed for hybrid request %s. "
-                        "Skip invalid-block fallback to avoid scheduler crash. "
-                        "failed_blocks=%s",
-                        request.req_id,
-                        missing_block_ids,
+                if ret is not None and any(r != 0 for r in ret):
+                    missing_block_ids = record_failed_blocks(
+                        block_id_list_c,
+                        ret,
                     )
-            logger.debug(
-                "KV pool worker backend get returned request=%s token_len=%d groups=%s keys=%d",
-                request.req_id,
-                token_len,
-                load_group_ids,
-                len(key_list_c),
-            )
+                    if len(request.block_ids_by_group) == 1:
+                        self._invalid_block_ids.update(missing_block_ids)
+                    elif missing_block_ids:
+                        logger.error(
+                            "KV load failed for hybrid request %s. "
+                            "Skip invalid-block fallback to avoid scheduler crash. "
+                            "failed_blocks=%s",
+                            request.req_id,
+                            missing_block_ids,
+                        )
+                elif ret is None:
+                    missing_block_ids = record_failed_blocks(
+                        block_id_list_c,
+                        [1] * len(block_id_list_c),
+                    )
+                    if len(request.block_ids_by_group) == 1:
+                        self._invalid_block_ids.update(missing_block_ids)
+                    elif missing_block_ids:
+                        logger.error(
+                            "KV load failed for hybrid request %s. "
+                            "Skip invalid-block fallback to avoid scheduler crash. "
+                            "failed_blocks=%s",
+                            request.req_id,
+                            missing_block_ids,
+                        )
+                logger.debug(
+                    "KV pool worker backend get returned request=%s token_len=%d groups=%s keys=%d",
+                    request.req_id,
+                    token_len,
+                    load_group_ids,
+                    len(key_list_c),
+                )
 
     def _record_kv_connector_operation(self, operation: str, duration_seconds: float, num_keys: int) -> None:
         with self._kv_stats_lock:
@@ -2331,6 +2338,7 @@ class KVPoolWorker:
         batch_size = self.layerwise_max_transfer_blocks if self.layerwise_max_transfer_blocks > 0 else max(1, len(keys))
         return [keys[start : start + batch_size] for start in range(0, len(keys), batch_size)]
 
+    @pool_diag.timed("lookup")
     def _filter_pool_existing_keys(self, keys: list[str]) -> list[str]:
         """Drop keys whose block is already readable in the pool.
 
@@ -2347,20 +2355,25 @@ class KVPoolWorker:
         Failing open (treat as missing) is intentional: an unreadable pool costs
         hits, while a bogus skip would cost the blocks themselves.
         """
+        pool_diag.add(candidate_keys=len(keys))
         if not keys:
             return []
         if not getattr(self.m_store, "requires_exists_before_put", True):
+            pool_diag.add(lookup_skipped_keys=len(keys))
             return keys
         exists = getattr(self.m_store, "exists", None)
         if not callable(exists):
             exists = getattr(self.m_store, "batch_is_exist", None)
         if not callable(exists):
+            pool_diag.add(lookup_skipped_keys=len(keys))
             return keys
 
         missing: list[str] = []
         for key_batch in self._layerwise_key_batches(keys):
             try:
                 states = exists(key_batch)
+                pool_diag.add(lookup_calls=1, lookup_keys=len(key_batch),
+                              lookup_hits=sum(int(state) == 1 for state in states))
                 if len(states) != len(key_batch):
                     raise RuntimeError(
                         "Block-key pool existence check returned unexpected number of states: "
@@ -2368,12 +2381,15 @@ class KVPoolWorker:
                     )
                 missing.extend(key for key, state in zip(key_batch, states, strict=True) if int(state) != 1)
             except Exception as exc:
+                pool_diag.add(lookup_failures=1)
                 logger.error(
                     "Block-key pool existence check failed keys=%d error=%s; treating all as missing",
                     len(key_batch),
                     exc,
                 )
                 missing.extend(key_batch)
+        pool_diag.add(missing_keys=len(missing), retained_keys=len(keys) - len(missing),
+                      all_hit_groups=int(bool(keys) and not missing))
         return missing
 
     def _start_layerwise_put_keys(self, keys: list[str], object_size: int) -> list[int]:
@@ -2452,10 +2468,13 @@ class KVPoolWorker:
         self._current_layerwise_request_ids.difference_update(req_ids)
         self._current_layerwise_last_chunk_req_ids.difference_update(req_ids)
 
+    @pool_diag.task("save_prepare")
+    @pool_diag.timed("prepare")
     def _prepare_layerwise_put_session(self, request: ReqMeta) -> None:
         request.save_block_keys = []
         request.save_last_block_key = None
         if not self._is_layerwise_save_owner() or not request.can_save:
+            pool_diag.outcome("skipped")
             return
 
         start_block = request.save_start_token // self.block_size
@@ -2481,11 +2500,13 @@ class KVPoolWorker:
             key_slots.append((request.save_last_block_key, None, request.partial_block_index))
 
         requested_keys = list(dict.fromkeys(key for key, _, _ in key_slots))
+        pool_diag.add(candidate_keys=len(requested_keys))
         if not requested_keys:
             return
         with self._put_started_keys_lock:
             previously_started = set(requested_keys) & self._put_started_keys
             new_keys = [key for key in requested_keys if key not in self._put_started_keys]
+            pool_diag.add(inflight_keys=len(previously_started), missing_keys=len(new_keys))
 
         started = set(previously_started)
         if new_keys:
@@ -2515,6 +2536,8 @@ class KVPoolWorker:
             ((key, block_index) for key, _, block_index in key_slots if key in started),
         )
 
+    @pool_diag.task("load_key_prepare")
+    @pool_diag.timed("build_key")
     def _prepare_layerwise_get_session(self, request: ReqMeta) -> list[tuple[str, int, int | None]]:
         request.load_block_keys = []
         request.load_last_block_key = None
@@ -2562,6 +2585,7 @@ class KVPoolWorker:
             key_slots.append((key, request.block_ids[block_index], block_index))
         return key_slots
 
+    @pool_diag.task("load_prepare")
     def _open_layerwise_get_sessions(self, request_key_slots: list[tuple[ReqMeta, str, int, int | None]]) -> None:
         if not request_key_slots:
             return
@@ -2644,7 +2668,8 @@ class KVPoolWorker:
                         break
                 if first_task is None:
                     continue
-                shared = self.kv_send_thread.build_shared_data(first_task)
+                with pool_diag.processing(pool_diag.capture(first_task, "save_prepare", self.tp_rank, queued=False)):
+                    shared = self.kv_send_thread.build_shared_data(first_task)
                 if shared is not None:
                     all_save_keys.extend(shared.save_keys)
                     for layer_id in range(self.num_layers):
@@ -2667,7 +2692,8 @@ class KVPoolWorker:
                     break
             if first_task is None:
                 return
-            cached = self.kv_send_thread.build_cached_process_tokens(first_task)
+            with pool_diag.processing(pool_diag.capture(first_task, "save_key_prepare", self.tp_rank, queued=False)):
+                cached = self.kv_send_thread.build_cached_process_tokens(first_task)
             if cached is not None:
                 for layer_id in range(self.num_layers):
                     for task in self.layer_save_tasks[layer_id]:
@@ -2691,7 +2717,8 @@ class KVPoolWorker:
                         break
                 if first_task is None:
                     continue
-                shared = self.kv_recv_thread.build_shared_data(first_task)
+                with pool_diag.processing(pool_diag.capture(first_task, "load_prepare", self.tp_rank, queued=False)):
+                    shared = self.kv_recv_thread.build_shared_data(first_task)
                 if shared is not None:
                     for layer_id in range(self.num_layers):
                         for task in self.layer_load_tasks[layer_id]:
@@ -2715,7 +2742,8 @@ class KVPoolWorker:
                     )
                     key = (task.use_key_major_ranges, ranges)
                     if key not in shared_by_ranges:
-                        shared = self.kv_recv_thread.build_shared_data(task)
+                        with pool_diag.processing(pool_diag.capture(task, "load_prepare", self.tp_rank, queued=False)):
+                            shared = self.kv_recv_thread.build_shared_data(task)
                         if shared is not None:
                             # The builder reuses scratch arrays on the next
                             # call; retain each selection's own snapshot.
@@ -2821,7 +2849,14 @@ class KVPoolWorker:
             num_local = getattr(self, "layerwise_key_layers", 0) or self.num_layers
         else:
             num_local = self.num_layers
-        self._wait_for_final_layer_save(num_local, self.kv_send_thread)
+        snapshot = getattr(self, "_diagnostic_deferred_save_snapshot", None)
+        self._diagnostic_deferred_save_snapshot = None
+        if snapshot is None:
+            snapshot = pool_diag.capture(None, "save_wait", getattr(self, "tp_rank", None), queued=False)
+        with pool_diag.processing(snapshot):
+            with pool_diag.stage("save_wait"):
+                self._wait_for_final_layer_save(num_local, self.kv_send_thread)
+            pool_diag.outcome("wait_returned")
 
     def process_layer_data(self, requests: list[ReqMeta]) -> None:
         self._masked_runs_cache.clear()
@@ -2861,6 +2896,21 @@ class KVPoolWorker:
                     group_requests.get(group_id, requests), local_layer, group_id, layer_idx_in_group
                 )
         self._build_shared_load_data()
+        # The last actual queue entry is the completion fence, not necessarily
+        # the model's final layer (which may have no reachable transfer rows).
+        if self.kv_send_thread is not None:
+            self.kv_send_thread._diagnostic_final_layer_id = max(
+                (layer_id for layer_id, tasks in enumerate(self.layer_save_tasks) if tasks), default=-1
+            )
+        if self.kv_recv_thread is not None:
+            self.kv_recv_thread._diagnostic_final_layer_id = max(
+                (
+                    layer_id
+                    for layer_id, tasks in enumerate(self.layer_load_tasks)
+                    if tasks or layer_id in self.prefetch_layer_map
+                ),
+                default=-1,
+            )
 
     def _check_hybrid_load_errors(self) -> None:
         # A hybrid block ID can belong to SWA, compressed KV or compressor
@@ -3071,8 +3121,16 @@ class KVPoolWorker:
                 # start of the NEXT step's start_load_kv, absorbing the send
                 # thread's tail latency into the inter-step scheduling gap.
                 self._pending_last_save_drain = True
+                self._diagnostic_deferred_save_snapshot = pool_diag.capture(
+                    connector_metadata, "save_wait", getattr(self, "tp_rank", None), queued=False
+                )
             else:
-                self._wait_for_final_layer_save(num_local, send_thread)
+                with pool_diag.processing(
+                    pool_diag.capture(connector_metadata, "save_wait", getattr(self, "tp_rank", None), queued=False)
+                ):
+                    with pool_diag.stage("save_wait"):
+                        self._wait_for_final_layer_save(num_local, send_thread)
+                    pool_diag.outcome("wait_returned")
         self.current_layer += 1
 
     def _wait_for_final_layer_save(self, num_local: int, send_thread: KVTransferThread) -> None:
@@ -3131,6 +3189,7 @@ class KVPoolWorker:
             send_thread.wait_for_requests_saved(released_req_ids)
         # Layerwise saves are already synchronized at each step's final layer.
 
+    @pool_diag.task("save_submit")
     def wait_for_save(self, connector_metadata: AscendConnectorMetadata) -> None:
         current_event = None
         assert self.kv_send_thread is not None
@@ -3140,6 +3199,7 @@ class KVPoolWorker:
         for request in connector_metadata.requests:
             can_save = request.can_save
             if can_save is None or not can_save:
+                pool_diag.add(save_eligibility_unknown=int(can_save is None), save_skipped=int(can_save is False))
                 continue
             if current_event is None:
                 current_event = torch.npu.Event()
@@ -3149,13 +3209,16 @@ class KVPoolWorker:
             requests.append(request)
 
         if not requests:
+            pool_diag.outcome("no_task")
             return
 
         if not isinstance(send_thread, KVCacheStoreSendingThread):
             raise TypeError(
                 f"Non-layerwise KV save requires KVCacheStoreSendingThread, but got {type(send_thread).__name__}"
             )
-        self._previous_save_batch = send_thread.add_save_batch(requests)
+        with pool_diag.stage("queue_submission"):
+            self._previous_save_batch = send_thread.add_save_batch(requests)
+        pool_diag.outcome("submission_returned")
 
     def retrieve_layer(
         self,
@@ -3383,6 +3446,7 @@ class KVPoolWorker:
             block_hashes, block_ids, token_len, mask_num
         )
         if not keys:
+            pool_diag.outcome("no_task")
             return
         offset = self.tp_rank % len(keys)
         keys_c = keys[offset:] + keys[:offset]
@@ -3395,7 +3459,7 @@ class KVPoolWorker:
             keys_c[:3],
         )
         load_get_start = time.perf_counter()
-        ret = self.m_store.get(keys_c, addrs_c, sizes_c)
+        ret = pool_diag.get(self.m_store, keys_c, addrs_c, sizes_c)
         self._record_kv_connector_operation(
             "load_get",
             time.perf_counter() - load_get_start,
@@ -3433,23 +3497,28 @@ class KVPoolWorker:
                 shard_size=self.pcp_size,
             )
             if not keys:
+                pool_diag.outcome("no_task")
                 return
+            pool_diag.add(candidate_keys=len(keys))
             exists_states = send_thread.lookup(keys)  # type: ignore[attr-defined]
             missing_indices = [i for i, exists in enumerate(exists_states) if not exists]
+            pool_diag.add(missing_keys=len(missing_indices), retained_keys=len(keys) - len(missing_indices))
             if not missing_indices:
+                pool_diag.add(all_hit_groups=1)
                 return
             keys = [keys[i] for i in missing_indices]
             addrs = [addrs[i] for i in missing_indices]
             sizes = [sizes[i] for i in missing_indices]
             if req_meta.current_event is not None:
-                req_meta.current_event.synchronize()
+                with pool_diag.stage("sync"):
+                    req_meta.current_event.synchronize()
             logger.debug(
                 "KV pool worker tp_mismatch put req=%s keys=%d sample_keys=%s",
                 req_id,
                 len(keys),
                 keys[:3],
             )
-            self.m_store.put(keys, addrs, sizes)
+            pool_diag.put(self.m_store, keys, addrs, sizes)
 
             if self.enable_kv_events:
                 event_block_size = (

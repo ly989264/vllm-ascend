@@ -19,6 +19,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.metrics import pd_diagnostics as diag
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 from vllm.v1.serial_utils import MsgpackEncoder
@@ -1053,6 +1054,7 @@ class KVPoolScheduler:
         meta = AscendConnectorMetadata(
             scheduler_output.preempted_req_ids,
             self._loading_req_ids.copy(),
+            pd_execution_id=getattr(scheduler_output, "pd_execution_id", None),
         )
         # Immediate block free: requests finished in the previous output
         # processing and requests preempted by this schedule released their
@@ -1110,7 +1112,41 @@ class KVPoolScheduler:
                     self.touch_sending_mamba_blocks(req_meta)
                     meta.add_request(req_meta)
 
+        self._emit_load_links(meta, scheduler_output)
         return meta
+
+    def _emit_load_links(self, meta: AscendConnectorMetadata, scheduler_output: SchedulerOutput) -> None:
+        """Write one link record per request whose asynchronous pool load this step submits.
+
+        Such a request waits for its load outside this step's scheduled requests, so this
+        record is what ties it to the step's execution_id (same shape as the P/D consumer link).
+        Synchronous and layerwise loads run inside the step that schedules the request and
+        need no link.
+        """
+        try:
+            if not self.load_async or self.use_layerwise:
+                return
+            transfer_config = self.vllm_config.kv_transfer_config
+            for req_meta in meta.requests:
+                load_spec = req_meta.load_spec
+                if load_spec is None or not load_spec.can_load:
+                    continue
+                link = diag.Batch(
+                    "pd_transfer_summary",
+                    scope="link",
+                    request_id=req_meta.req_id,
+                    execution_id=scheduler_output.pd_execution_id,
+                    engine_id=getattr(transfer_config, "engine_id", None),
+                    dp_rank=self.vllm_config.parallel_config.data_parallel_rank,
+                    transfer_role="pool_load",
+                    load_async=True,
+                    vllm_cached_tokens=load_spec.vllm_cached_tokens,
+                    kvpool_cached_tokens=load_spec.kvpool_cached_tokens,
+                )
+                link.finish(status="linked", complete=True, incomplete=False)
+        except Exception:
+            # Diagnostics must never change scheduling.
+            pass
 
     def get_sending_event_id(self):
         """
